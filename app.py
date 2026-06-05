@@ -1,5 +1,5 @@
-from fastapi import FastAPI, HTTPException, Request, UploadFile, File
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 from typing import List, Optional
 from pathlib import Path
@@ -25,7 +25,7 @@ UPLOAD_DIR = BASE_DIR / "uploads"
 OUT_DIR.mkdir(exist_ok=True)
 UPLOAD_DIR.mkdir(exist_ok=True)
 
-app = FastAPI(title="Receipt DOCX Generator", version="1.0.7")
+app = FastAPI(title="Receipt DOCX Generator", version="1.0.8")
 
 
 class ReceiptItem(BaseModel):
@@ -106,17 +106,28 @@ def image_from_url(url: str) -> Image.Image:
     return img
 
 
+def save_uploaded_file_as_png(file: UploadFile, dest_path: Path):
+    try:
+        img = Image.open(file.file)
+        img = ImageOps.exif_transpose(img)
+        img.load()
+        if img.mode not in ("RGB", "RGBA"):
+            img = img.convert("RGB")
+        img.save(dest_path, format="PNG")
+        return dest_path
+    except Exception:
+        raise HTTPException(status_code=400, detail=f"{file.filename} 이미지를 처리할 수 없습니다.")
+
+
 def save_receipt_image(receipt: ReceiptItem, output_path: Path):
     img = None
 
-    # URL 우선
     if receipt.receipt_image_url:
         try:
             img = image_from_url(receipt.receipt_image_url)
         except Exception:
             img = None
 
-    # base64 보조
     if img is None and receipt.receipt_image_base64 and len(receipt.receipt_image_base64.strip()) > 100:
         try:
             img = image_from_base64(receipt.receipt_image_base64)
@@ -194,16 +205,41 @@ def append_doc_body(target_doc: Document, source_doc: Document):
         body.append(deepcopy(child))
 
 
+def save_final_doc(request: Request, pages, filename: str):
+    folder_id = str(uuid.uuid4())
+    tmp_dir = OUT_DIR / folder_id
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    final_doc = pages[0]
+    for page in pages[1:]:
+        append_doc_body(final_doc, page)
+
+    if not filename.endswith(".docx"):
+        filename += ".docx"
+
+    out_path = tmp_dir / filename
+    final_doc.save(out_path)
+
+    encoded_filename = urllib.parse.quote(filename)
+    base_url = str(request.base_url).rstrip("/")
+    download_url = f"{base_url}/download/{folder_id}/{encoded_filename}"
+    return download_url, filename
+
+
 @app.get("/", response_class=HTMLResponse)
 def root():
     return """
     <html>
       <head><title>Receipt DOCX Generator</title></head>
-      <body style="font-family:sans-serif; padding:40px;">
-        <h2>Receipt DOCX Generator</h2>
-        <p>영수증 이미지를 업로드하려면 아래 링크를 클릭하세요.</p>
-        <p><a href="/upload">영수증 이미지 업로드 페이지 열기</a></p>
-        <p><a href="/health">health check</a></p>
+      <body style="font-family:sans-serif; padding:40px; line-height:1.7;">
+        <h2>Receipt DOCX Generator v1.0.8</h2>
+        <p>아래 페이지에서 영수증 이미지를 포함한 DOCX를 바로 생성할 수 있습니다.</p>
+        <ul>
+          <li><a href="/form">영수증 1건 DOCX 생성</a></li>
+          <li><a href="/bulk-form">여러 영수증 DOCX 생성</a></li>
+          <li><a href="/upload">이미지 URL만 생성</a></li>
+          <li><a href="/health">health check</a></li>
+        </ul>
       </body>
     </html>
     """
@@ -214,19 +250,131 @@ def health():
     return {"status": "ok"}
 
 
+@app.get("/form", response_class=HTMLResponse)
+def form_page():
+    return """
+    <html>
+      <head><title>영수증 증빙자료 생성</title></head>
+      <body style="font-family:sans-serif; padding:40px; max-width:760px;">
+        <h2>영수증 증빙자료 DOCX 생성</h2>
+        <p>영수증 이미지와 확인된 정보만 입력하면 DOCX가 바로 생성됩니다.</p>
+        <form action="/create-from-form" enctype="multipart/form-data" method="post">
+          <p>사용일자<br><input name="use_date" type="text" placeholder="2025-09-18" required style="width:300px;"></p>
+          <p>사용처<br><input name="store" type="text" placeholder="동남집 여의도점" required style="width:300px;"></p>
+          <p>사용금액<br><input name="amount" type="text" placeholder="100,000원" required style="width:300px;"></p>
+          <p>영수증 이미지<br><input name="receipt_image" type="file" accept="image/*" required></p>
+          <button type="submit">DOCX 생성</button>
+        </form>
+        <p style="margin-top:30px;"><a href="/">처음으로</a></p>
+      </body>
+    </html>
+    """
+
+
+@app.post("/create-from-form")
+async def create_from_form(
+    request: Request,
+    use_date: str = Form(...),
+    store: str = Form(...),
+    amount: str = Form(...),
+    receipt_image: UploadFile = File(...),
+):
+    folder = UPLOAD_DIR / str(uuid.uuid4())
+    folder.mkdir(parents=True, exist_ok=True)
+    img_path = folder / "receipt.png"
+    save_uploaded_file_as_png(receipt_image, img_path)
+
+    receipt = ReceiptItem(use_date=use_date, store=store, amount=amount)
+    page = fill_template(
+        receipt,
+        "중앙청년지원센터 법인카드(0000)",
+        "중앙청년지원센터 매니저",
+        "",
+        img_path
+    )
+    download_url, filename = save_final_doc(request, [page], "법인카드_영수증_증빙자료.docx")
+    return RedirectResponse(download_url, status_code=303)
+
+
+@app.get("/bulk-form", response_class=HTMLResponse)
+def bulk_form_page():
+    fields = ""
+    for i in range(1, 11):
+        required = "required" if i == 1 else ""
+        fields += f"""
+        <fieldset style="margin:20px 0; padding:15px;">
+          <legend>영수증 {i}</legend>
+          <p>사용일자<br><input name="use_date_{i}" type="text" placeholder="2025-09-18" style="width:300px;" {required}></p>
+          <p>사용처<br><input name="store_{i}" type="text" placeholder="동남집 여의도점" style="width:300px;" {required}></p>
+          <p>사용금액<br><input name="amount_{i}" type="text" placeholder="100,000원" style="width:300px;" {required}></p>
+          <p>영수증 이미지<br><input name="receipt_image_{i}" type="file" accept="image/*" {required}></p>
+        </fieldset>
+        """
+    return f"""
+    <html>
+      <head><title>여러 영수증 증빙자료 생성</title></head>
+      <body style="font-family:sans-serif; padding:40px; max-width:800px;">
+        <h2>여러 영수증 DOCX 생성</h2>
+        <p>최대 10건까지 하나의 DOCX 파일로 생성합니다. 1번은 필수, 나머지는 필요한 만큼만 입력하세요.</p>
+        <form action="/create-bulk-from-form" enctype="multipart/form-data" method="post">
+          {fields}
+          <button type="submit">통합 DOCX 생성</button>
+        </form>
+        <p style="margin-top:30px;"><a href="/">처음으로</a></p>
+      </body>
+    </html>
+    """
+
+
+@app.post("/create-bulk-from-form")
+async def create_bulk_from_form(request: Request):
+    form = await request.form()
+    pages = []
+    folder = UPLOAD_DIR / str(uuid.uuid4())
+    folder.mkdir(parents=True, exist_ok=True)
+
+    for i in range(1, 11):
+        use_date = (form.get(f"use_date_{i}") or "").strip()
+        store = (form.get(f"store_{i}") or "").strip()
+        amount = (form.get(f"amount_{i}") or "").strip()
+        image = form.get(f"receipt_image_{i}")
+
+        if not use_date and not store and not amount:
+            continue
+
+        if not use_date or not store or not amount or not image:
+            raise HTTPException(status_code=400, detail=f"영수증 {i}의 필수 정보가 누락되었습니다.")
+
+        img_path = folder / f"receipt_{i}.png"
+        save_uploaded_file_as_png(image, img_path)
+
+        receipt = ReceiptItem(use_date=use_date, store=store, amount=amount)
+        pages.append(fill_template(
+            receipt,
+            "중앙청년지원센터 법인카드(0000)",
+            "중앙청년지원센터 매니저",
+            "",
+            img_path
+        ))
+
+    if not pages:
+        raise HTTPException(status_code=400, detail="입력된 영수증이 없습니다.")
+
+    download_url, filename = save_final_doc(request, pages, "법인카드_영수증_증빙자료.docx")
+    return RedirectResponse(download_url, status_code=303)
+
+
 @app.get("/upload", response_class=HTMLResponse)
 def upload_page():
     return """
     <html>
       <head><title>영수증 이미지 업로드</title></head>
       <body style="font-family:sans-serif; padding:40px; max-width:720px;">
-        <h2>영수증 이미지 업로드</h2>
-        <p>영수증 이미지를 업로드하면 image_url이 생성됩니다.</p>
+        <h2>영수증 이미지 URL 생성</h2>
         <form action="/upload-receipt" enctype="multipart/form-data" method="post">
           <input name="file" type="file" accept="image/*" required>
           <button type="submit">업로드</button>
         </form>
-        <p style="margin-top:30px; color:#666;">생성된 image_url을 복사해서 MyGPT에 함께 전달하세요.</p>
       </body>
     </html>
     """
@@ -241,28 +389,9 @@ async def upload_receipt(request: Request, file: UploadFile = File(...)):
     folder = UPLOAD_DIR / folder_id
     folder.mkdir(parents=True, exist_ok=True)
 
-    ext = Path(file.filename or "").suffix.lower()
-    if ext not in [".jpg", ".jpeg", ".png", ".webp", ".bmp"]:
-        ext = ".png"
-
-    filename = f"receipt{ext}"
-    raw_path = folder / filename
-
-    with raw_path.open("wb") as f:
-        shutil.copyfileobj(file.file, f)
-
-    # 안정적으로 PNG로 변환
     png_name = "receipt.png"
     png_path = folder / png_name
-    try:
-        img = Image.open(raw_path)
-        img = ImageOps.exif_transpose(img)
-        img.load()
-        if img.mode not in ("RGB", "RGBA"):
-            img = img.convert("RGB")
-        img.save(png_path, format="PNG")
-    except Exception:
-        raise HTTPException(status_code=400, detail="이미지를 처리할 수 없습니다.")
+    save_uploaded_file_as_png(file, png_path)
 
     base_url = str(request.base_url).rstrip("/")
     image_url = f"{base_url}/uploaded/{folder_id}/{png_name}"
@@ -326,20 +455,7 @@ def create_receipt_docx(req: ReceiptRequest, request: Request):
         saved_img = save_receipt_image(receipt, img_path)
         pages.append(fill_template(receipt, req.card_name, req.user_name, req.purpose, saved_img))
 
-    final_doc = pages[0]
-    for page in pages[1:]:
-        append_doc_body(final_doc, page)
-
-    filename = req.output_filename or "법인카드_영수증_증빙자료.docx"
-    if not filename.endswith(".docx"):
-        filename += ".docx"
-
-    out_path = tmp_dir / filename
-    final_doc.save(out_path)
-
-    encoded_filename = urllib.parse.quote(filename)
-    base_url = str(request.base_url).rstrip("/")
-    download_url = f"{base_url}/download/{folder_id}/{encoded_filename}"
+    download_url, filename = save_final_doc(request, pages, req.output_filename or "법인카드_영수증_증빙자료.docx")
 
     return {
         "status": "success",
