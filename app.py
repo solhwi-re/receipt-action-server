@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from typing import List, Optional
@@ -10,18 +10,19 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT
 from docx.shared import Inches, Pt
 from docx.oxml.ns import qn
-from PIL import Image, ImageOps, UnidentifiedImageError
+from PIL import Image, ImageOps
 import base64
 import uuid
 import re
 import requests
+import urllib.parse
 
 BASE_DIR = Path(__file__).resolve().parent
 TEMPLATE_PATH = BASE_DIR / "template.docx"
 OUT_DIR = BASE_DIR / "outputs"
 OUT_DIR.mkdir(exist_ok=True)
 
-app = FastAPI(title="Receipt DOCX Generator", version="1.0.5")
+app = FastAPI(title="Receipt DOCX Generator", version="1.0.6")
 
 
 class ReceiptItem(BaseModel):
@@ -103,12 +104,8 @@ def image_from_url(url: str) -> Image.Image:
 
 
 def save_receipt_image(receipt: ReceiptItem, output_path: Path):
-    """
-    base64 또는 URL이 있으면 이미지 저장.
-    둘 다 없거나 실패하면 None 반환.
-    400을 내지 않고 문서에는 안내문을 넣는다.
-    """
     img = None
+
     if receipt.receipt_image_base64 and len(receipt.receipt_image_base64.strip()) > 100:
         try:
             img = image_from_base64(receipt.receipt_image_base64)
@@ -140,8 +137,8 @@ def insert_receipt_area(doc, img_path: Optional[Path]):
     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
     if img_path is None:
-        run = p.add_run("영수증 이미지 전달 필요")
-        style_run(run, size_pt=13, bold=True)
+        run = p.add_run("")
+        style_run(run, size_pt=13)
         return
 
     with Image.open(img_path) as im:
@@ -152,6 +149,7 @@ def insert_receipt_area(doc, img_path: Optional[Path]):
     aspect = w_px / h_px if h_px else 1
     width_in = min(max_w_in, max_h_in * aspect)
     height_in = width_in / aspect
+
     if height_in > max_h_in:
         height_in = max_h_in
         width_in = height_in * aspect
@@ -192,7 +190,7 @@ def append_doc_body(target_doc: Document, source_doc: Document):
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "Receipt DOCX Generator", "version": "1.0.5"}
+    return {"status": "ok", "service": "Receipt DOCX Generator", "version": "1.0.6"}
 
 
 @app.get("/health")
@@ -200,14 +198,31 @@ def health():
     return {"status": "ok"}
 
 
+@app.get("/download/{folder_id}/{filename}")
+def download_file(folder_id: str, filename: str):
+    safe_folder = Path(folder_id).name
+    safe_filename = Path(filename).name
+    file_path = OUT_DIR / safe_folder / safe_filename
+
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="파일을 찾을 수 없습니다.")
+
+    return FileResponse(
+        file_path,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        filename=safe_filename,
+    )
+
+
 @app.post("/create-receipt-docx")
-def create_receipt_docx(req: ReceiptRequest):
+def create_receipt_docx(req: ReceiptRequest, request: Request):
     if not TEMPLATE_PATH.exists():
         raise HTTPException(status_code=500, detail="template.docx 파일이 서버에 없습니다.")
     if not req.receipts:
         raise HTTPException(status_code=400, detail="영수증 데이터가 없습니다.")
 
-    tmp_dir = OUT_DIR / str(uuid.uuid4())
+    folder_id = str(uuid.uuid4())
+    tmp_dir = OUT_DIR / folder_id
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
     pages = []
@@ -227,8 +242,13 @@ def create_receipt_docx(req: ReceiptRequest):
     out_path = tmp_dir / filename
     final_doc.save(out_path)
 
-    return FileResponse(
-        out_path,
-        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        filename=filename,
-    )
+    encoded_filename = urllib.parse.quote(filename)
+    base_url = str(request.base_url).rstrip("/")
+    download_url = f"{base_url}/download/{folder_id}/{encoded_filename}"
+
+    return {
+        "status": "success",
+        "message": "DOCX 파일이 생성되었습니다. download_url에서 파일을 내려받을 수 있습니다.",
+        "download_url": download_url,
+        "filename": filename,
+    }
