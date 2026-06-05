@@ -14,20 +14,22 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 import base64
 import uuid
 import re
+import requests
 
 BASE_DIR = Path(__file__).resolve().parent
 TEMPLATE_PATH = BASE_DIR / "template.docx"
 OUT_DIR = BASE_DIR / "outputs"
 OUT_DIR.mkdir(exist_ok=True)
 
-app = FastAPI(title="Receipt DOCX Generator", version="1.0.4")
+app = FastAPI(title="Receipt DOCX Generator", version="1.0.5")
 
 
 class ReceiptItem(BaseModel):
     use_date: str = Field(..., description="YYYY-MM-DD")
     store: str = Field(..., description="영수증 상호명")
     amount: str = Field(..., description="예: 52,000원")
-    receipt_image_base64: str = Field(..., description="영수증 원본 이미지 base64 또는 data URL")
+    receipt_image_base64: Optional[str] = Field(None, description="영수증 원본 이미지 base64 또는 data URL")
+    receipt_image_url: Optional[str] = Field(None, description="영수증 원본 이미지 URL")
 
 
 class ReceiptRequest(BaseModel):
@@ -39,7 +41,6 @@ class ReceiptRequest(BaseModel):
 
 
 def clear_cell(cell):
-    """셀 속성(tcPr)은 유지하고 내용만 삭제한다."""
     tc = cell._tc
     for child in list(tc):
         if child.tag != qn("w:tcPr"):
@@ -53,21 +54,11 @@ def style_run(run, size_pt=13, bold=False):
     run.font.bold = bold
 
 
-def set_center(cell):
-    cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
-    for p in cell.paragraphs:
-        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-
-
 def write_center(cell, text, size_pt=13, bold=False):
     clear_cell(cell)
     p = cell.add_paragraph()
-    try:
-        p.style = "바탕글"
-    except Exception:
-        pass
     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = p.add_run(text)
+    run = p.add_run(text or "")
     style_run(run, size_pt=size_pt, bold=bold)
     cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
 
@@ -77,28 +68,17 @@ def write_amount_cell(cell, amount):
     cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
 
     p1 = cell.add_paragraph()
-    try:
-        p1.style = "바탕글"
-    except Exception:
-        pass
     p1.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    r1 = p1.add_run(amount)
+    r1 = p1.add_run(amount or "")
     style_run(r1, size_pt=13)
 
     p2 = cell.add_paragraph()
-    try:
-        p2.style = "바탕글"
-    except Exception:
-        pass
     p2.alignment = WD_ALIGN_PARAGRAPH.CENTER
     r2 = p2.add_run("* 비목: 인증연구 > 업무추진비 > 회의비")
     style_run(r2, size_pt=11)
 
 
-def normalize_base64_image(image_base64: str, output_path: Path, index: int):
-    if not image_base64 or len(image_base64.strip()) < 100:
-        raise HTTPException(status_code=400, detail=f"{index}번째 영수증 이미지 데이터가 너무 짧습니다.")
-
+def image_from_base64(image_base64: str) -> Image.Image:
     data = image_base64.strip()
     if "," in data and data.lower().startswith("data:image"):
         data = data.split(",", 1)[1]
@@ -106,18 +86,43 @@ def normalize_base64_image(image_base64: str, output_path: Path, index: int):
     missing_padding = len(data) % 4
     if missing_padding:
         data += "=" * (4 - missing_padding)
+    raw = base64.b64decode(data, validate=False)
+    img = Image.open(BytesIO(raw))
+    img = ImageOps.exif_transpose(img)
+    img.load()
+    return img
 
-    try:
-        raw = base64.b64decode(data, validate=False)
-    except Exception:
-        raise HTTPException(status_code=400, detail=f"{index}번째 영수증 이미지 base64를 디코딩하지 못했습니다.")
 
-    try:
-        img = Image.open(BytesIO(raw))
-        img = ImageOps.exif_transpose(img)
-        img.load()
-    except (UnidentifiedImageError, OSError, ValueError):
-        raise HTTPException(status_code=400, detail=f"{index}번째 영수증 이미지가 올바른 이미지 파일이 아닙니다.")
+def image_from_url(url: str) -> Image.Image:
+    resp = requests.get(url, timeout=20)
+    resp.raise_for_status()
+    img = Image.open(BytesIO(resp.content))
+    img = ImageOps.exif_transpose(img)
+    img.load()
+    return img
+
+
+def save_receipt_image(receipt: ReceiptItem, output_path: Path):
+    """
+    base64 또는 URL이 있으면 이미지 저장.
+    둘 다 없거나 실패하면 None 반환.
+    400을 내지 않고 문서에는 안내문을 넣는다.
+    """
+    img = None
+    if receipt.receipt_image_base64 and len(receipt.receipt_image_base64.strip()) > 100:
+        try:
+            img = image_from_base64(receipt.receipt_image_base64)
+        except Exception:
+            img = None
+
+    if img is None and receipt.receipt_image_url:
+        try:
+            img = image_from_url(receipt.receipt_image_url)
+        except Exception:
+            img = None
+
+    if img is None:
+        return None
 
     if img.mode not in ("RGB", "RGBA"):
         img = img.convert("RGB")
@@ -125,42 +130,40 @@ def normalize_base64_image(image_base64: str, output_path: Path, index: int):
     return output_path
 
 
-def insert_receipt_image(doc, img_path: Path):
-    # 템플릿 기준 8번째 행(인덱스 7)의 빈 영수증 칸에 삽입
+def insert_receipt_area(doc, img_path: Optional[Path]):
     table = doc.tables[0]
     receipt_cell = table.cell(7, 0)
     clear_cell(receipt_cell)
     receipt_cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
 
-    # 이미지 비율을 유지하면서 한 페이지/영수증 칸 안에 들어오도록 제한
+    p = receipt_cell.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    if img_path is None:
+        run = p.add_run("영수증 이미지 전달 필요")
+        style_run(run, size_pt=13, bold=True)
+        return
+
     with Image.open(img_path) as im:
         w_px, h_px = im.size
 
     max_w_in = 5.7
-    max_h_in = 3.45
+    max_h_in = 3.35
     aspect = w_px / h_px if h_px else 1
     width_in = min(max_w_in, max_h_in * aspect)
     height_in = width_in / aspect
-
     if height_in > max_h_in:
         height_in = max_h_in
         width_in = height_in * aspect
 
-    p = receipt_cell.add_paragraph()
-    try:
-        p.style = "바탕글"
-    except Exception:
-        pass
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
     run = p.add_run()
     run.add_picture(str(img_path), width=Inches(width_in))
 
 
-def fill_template(receipt: ReceiptItem, card_name: str, user_name: str, purpose: str, img_path: Path) -> Document:
+def fill_template(receipt: ReceiptItem, card_name: str, user_name: str, purpose: str, img_path: Optional[Path]) -> Document:
     doc = Document(str(TEMPLATE_PATH))
     table = doc.tables[0]
 
-    # 원본 표 셀 위치 기준으로 직접 입력
     write_center(table.cell(1, 1), card_name, size_pt=13)
     write_center(table.cell(1, 3), receipt.use_date, size_pt=13)
     write_center(table.cell(2, 1), user_name, size_pt=13)
@@ -168,15 +171,13 @@ def fill_template(receipt: ReceiptItem, card_name: str, user_name: str, purpose:
     write_center(table.cell(4, 1), receipt.store, size_pt=13)
     write_amount_cell(table.cell(5, 1), receipt.amount)
 
-    # 모든 셀은 세로 가운데, 라벨/제목 포함 기존 정렬 유지 보정
     for row in table.rows:
         for cell in row.cells:
             cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
             for p in cell.paragraphs:
-                if p.alignment is None:
-                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
-    insert_receipt_image(doc, img_path)
+    insert_receipt_area(doc, img_path)
     return doc
 
 
@@ -191,7 +192,7 @@ def append_doc_body(target_doc: Document, source_doc: Document):
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "Receipt DOCX Generator", "version": "1.0.4"}
+    return {"status": "ok", "service": "Receipt DOCX Generator", "version": "1.0.5"}
 
 
 @app.get("/health")
@@ -212,8 +213,8 @@ def create_receipt_docx(req: ReceiptRequest):
     pages = []
     for i, receipt in enumerate(req.receipts, start=1):
         img_path = tmp_dir / f"receipt_{i}.png"
-        normalize_base64_image(receipt.receipt_image_base64, img_path, i)
-        pages.append(fill_template(receipt, req.card_name, req.user_name, req.purpose, img_path))
+        saved_img = save_receipt_image(receipt, img_path)
+        pages.append(fill_template(receipt, req.card_name, req.user_name, req.purpose, saved_img))
 
     final_doc = pages[0]
     for page in pages[1:]:
@@ -222,6 +223,7 @@ def create_receipt_docx(req: ReceiptRequest):
     filename = req.output_filename or "법인카드_영수증_증빙자료.docx"
     if not filename.endswith(".docx"):
         filename += ".docx"
+
     out_path = tmp_dir / filename
     final_doc.save(out_path)
 
