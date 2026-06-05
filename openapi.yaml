@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Receipt DOCX Generator
-  version: 1.0.8
+  version: 1.0.9
 servers:
   - url: https://receipt-action-server.onrender.com
 paths:
@@ -16,7 +16,10 @@ paths:
     post:
       operationId: create_receipt_docx_create_receipt_docx_post
       summary: Create Receipt Docx
-      description: 법인카드 영수증 증빙자료 DOCX를 생성하고 다운로드 URL을 반환합니다. receipt_image_url을 사용할 수 있습니다.
+      description: >
+        법인카드 영수증 증빙자료 DOCX를 생성하고 다운로드 URL을 반환합니다.
+        MyGPT에 업로드된 영수증 이미지는 receipt_image_file_path 필드로 전달하세요.
+        업로드 파일의 로컬 경로가 전달되면 플랫폼이 접근 가능한 URL로 변환할 수 있습니다.
       requestBody:
         required: true
         content:
@@ -48,9 +51,15 @@ components:
         amount:
           type: string
           description: 최종 승인금액. 예: 52,000원
+        receipt_image_file_path:
+          type: string
+          description: >
+            사용자가 MyGPT에 업로드한 영수증 이미지의 파일 경로를 넣습니다.
+            예: /mnt/data/receipt.jpg
+            이 필드는 Action 호출 시 플랫폼이 접근 가능한 파일 URL로 변환할 수 있도록 파일 인자로 사용합니다.
         receipt_image_url:
           type: string
-          description: 업로드된 영수증 이미지 URL.
+          description: 외부에서 접근 가능한 영수증 이미지 URL. 예: https://.../receipt.png
         receipt_image_base64:
           type: string
           description: 선택값. 영수증 원본 이미지 base64.
@@ -85,4 +94,6 @@ components:
         download_url:
           type: string
         filename:
+          type: string
+        image_status:
           type: string
