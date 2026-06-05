@@ -1,64 +1,79 @@
 openapi: 3.1.0
 info:
   title: Receipt DOCX Generator
-  version: 1.0.0
+  version: 1.0.5
 servers:
-  - url: https://YOUR-RENDER-APP-NAME.onrender.com
+  - url: https://receipt-action-server.onrender.com
 paths:
+  /health:
+    get:
+      operationId: health_health_get
+      summary: Health
+      responses:
+        "200":
+          description: Successful Response
   /create-receipt-docx:
     post:
-      operationId: createReceiptDocx
-      summary: Create a DOCX receipt evidence file from receipt OCR data and base64 images.
+      operationId: create_receipt_docx_create_receipt_docx_post
+      summary: Create Receipt Docx
+      description: >
+        법인카드 영수증 증빙자료 DOCX를 생성합니다.
+        영수증 이미지는 receipt_image_base64 또는 receipt_image_url 중 하나로 전달합니다.
+        첨부 이미지가 있는 경우 가능한 한 전체 원본 이미지를 base64로 변환하여 receipt_image_base64에 넣어주세요.
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              type: object
-              properties:
-                receipts:
-                  type: array
-                  items:
-                    type: object
-                    properties:
-                      use_date:
-                        type: string
-                        description: Usage date in YYYY-MM-DD format.
-                      store:
-                        type: string
-                        description: Store or restaurant name from the receipt.
-                      amount:
-                        type: string
-                        description: Final approved amount, e.g. 52,000원.
-                      receipt_image_base64:
-                        type: string
-                        description: Original receipt image encoded as base64.
-                    required: [use_date, store, amount, receipt_image_base64]
-                card_name:
-                  type: string
-                  default: 중앙청년지원센터 법인카드(0000)
-                user_name:
-                  type: string
-                  default: 중앙청년지원센터 매니저
-                purpose:
-                  type: string
-                  default: ""
-                output_filename:
-                  type: string
-                  default: 법인카드_영수증_증빙자료.docx
-              required: [receipts]
+              $ref: "#/components/schemas/ReceiptRequest"
       responses:
-        '200':
-          description: DOCX file
-          content:
-            application/vnd.openxmlformats-officedocument.wordprocessingml.document:
-              schema:
-                type: string
-                format: binary
-  /health:
-    get:
-      operationId: healthCheck
-      summary: Health check.
-      responses:
-        '200':
-          description: OK
+        "200":
+          description: Successful Response
+components:
+  schemas:
+    ReceiptItem:
+      type: object
+      required:
+        - use_date
+        - store
+        - amount
+      properties:
+        use_date:
+          type: string
+          description: 영수증 사용일자. 반드시 YYYY-MM-DD 형식.
+        store:
+          type: string
+          description: 영수증 상호명.
+        amount:
+          type: string
+          description: 최종 승인금액. 예: 52,000원
+        receipt_image_base64:
+          type: string
+          description: >
+            영수증 원본 이미지의 전체 base64 문자열. data:image/png;base64,... 형식도 가능.
+            첨부 이미지를 분석한 뒤 반드시 원본 이미지 전체를 base64로 변환해 입력.
+        receipt_image_url:
+          type: string
+          description: >
+            영수증 원본 이미지를 서버가 다운로드할 수 있는 URL. base64 전달이 어려운 경우 사용.
+    ReceiptRequest:
+      type: object
+      required:
+        - receipts
+      properties:
+        receipts:
+          type: array
+          items:
+            $ref: "#/components/schemas/ReceiptItem"
+        card_name:
+          type: string
+          default: 중앙청년지원센터 법인카드(0000)
+        user_name:
+          type: string
+          default: 중앙청년지원센터 매니저
+        purpose:
+          type: string
+          default: ""
+        output_filename:
+          type: string
+          default: 법인카드_영수증_증빙자료.docx
