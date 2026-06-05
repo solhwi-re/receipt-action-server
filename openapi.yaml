@@ -1,0 +1,64 @@
+openapi: 3.1.0
+info:
+  title: Receipt DOCX Generator
+  version: 1.0.0
+servers:
+  - url: https://YOUR-RENDER-APP-NAME.onrender.com
+paths:
+  /create-receipt-docx:
+    post:
+      operationId: createReceiptDocx
+      summary: Create a DOCX receipt evidence file from receipt OCR data and base64 images.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                receipts:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      use_date:
+                        type: string
+                        description: Usage date in YYYY-MM-DD format.
+                      store:
+                        type: string
+                        description: Store or restaurant name from the receipt.
+                      amount:
+                        type: string
+                        description: Final approved amount, e.g. 52,000원.
+                      receipt_image_base64:
+                        type: string
+                        description: Original receipt image encoded as base64.
+                    required: [use_date, store, amount, receipt_image_base64]
+                card_name:
+                  type: string
+                  default: 중앙청년지원센터 법인카드(0000)
+                user_name:
+                  type: string
+                  default: 중앙청년지원센터 매니저
+                purpose:
+                  type: string
+                  default: ""
+                output_filename:
+                  type: string
+                  default: 법인카드_영수증_증빙자료.docx
+              required: [receipts]
+      responses:
+        '200':
+          description: DOCX file
+          content:
+            application/vnd.openxmlformats-officedocument.wordprocessingml.document:
+              schema:
+                type: string
+                format: binary
+  /health:
+    get:
+      operationId: healthCheck
+      summary: Health check.
+      responses:
+        '200':
+          description: OK
