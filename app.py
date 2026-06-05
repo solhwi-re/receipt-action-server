@@ -9,6 +9,7 @@ from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT
 from docx.shared import Inches, Pt
+from docx.oxml.ns import qn
 from PIL import Image, ImageOps, UnidentifiedImageError
 import base64
 import uuid
@@ -19,7 +20,7 @@ TEMPLATE_PATH = BASE_DIR / "template.docx"
 OUT_DIR = BASE_DIR / "outputs"
 OUT_DIR.mkdir(exist_ok=True)
 
-app = FastAPI(title="Receipt DOCX Generator", version="1.0.2")
+app = FastAPI(title="Receipt DOCX Generator", version="1.0.4")
 
 
 class ReceiptItem(BaseModel):
@@ -35,6 +36,63 @@ class ReceiptRequest(BaseModel):
     user_name: str = "중앙청년지원센터 매니저"
     purpose: str = ""
     output_filename: Optional[str] = "법인카드_영수증_증빙자료.docx"
+
+
+def clear_cell(cell):
+    """셀 속성(tcPr)은 유지하고 내용만 삭제한다."""
+    tc = cell._tc
+    for child in list(tc):
+        if child.tag != qn("w:tcPr"):
+            tc.remove(child)
+
+
+def style_run(run, size_pt=13, bold=False):
+    run.font.name = "맑은 고딕"
+    run._element.rPr.rFonts.set(qn("w:eastAsia"), "맑은 고딕")
+    run.font.size = Pt(size_pt)
+    run.font.bold = bold
+
+
+def set_center(cell):
+    cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+    for p in cell.paragraphs:
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+
+def write_center(cell, text, size_pt=13, bold=False):
+    clear_cell(cell)
+    p = cell.add_paragraph()
+    try:
+        p.style = "바탕글"
+    except Exception:
+        pass
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = p.add_run(text)
+    style_run(run, size_pt=size_pt, bold=bold)
+    cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+
+
+def write_amount_cell(cell, amount):
+    clear_cell(cell)
+    cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+
+    p1 = cell.add_paragraph()
+    try:
+        p1.style = "바탕글"
+    except Exception:
+        pass
+    p1.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    r1 = p1.add_run(amount)
+    style_run(r1, size_pt=13)
+
+    p2 = cell.add_paragraph()
+    try:
+        p2.style = "바탕글"
+    except Exception:
+        pass
+    p2.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    r2 = p2.add_run("* 비목: 인증연구 > 업무추진비 > 회의비")
+    style_run(r2, size_pt=11)
 
 
 def normalize_base64_image(image_base64: str, output_path: Path, index: int):
@@ -67,124 +125,62 @@ def normalize_base64_image(image_base64: str, output_path: Path, index: int):
     return output_path
 
 
-def clear_paragraph_keep_style(paragraph):
-    """문단/첫 run 서식은 유지하고 텍스트만 비운다."""
-    if not paragraph.runs:
-        paragraph.add_run("")
-    for run in paragraph.runs:
-        run.text = ""
+def insert_receipt_image(doc, img_path: Path):
+    # 템플릿 기준 8번째 행(인덱스 7)의 빈 영수증 칸에 삽입
+    table = doc.tables[0]
+    receipt_cell = table.cell(7, 0)
+    clear_cell(receipt_cell)
+    receipt_cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
 
+    # 이미지 비율을 유지하면서 한 페이지/영수증 칸 안에 들어오도록 제한
+    with Image.open(img_path) as im:
+        w_px, h_px = im.size
 
-def set_first_run_text_keep_style(paragraph, text: str, font_size_pt: Optional[float] = None, bold: Optional[bool] = None):
-    """기존 문단/첫 run 스타일을 그대로 사용하면서 텍스트만 입력한다."""
-    if not paragraph.runs:
-        paragraph.add_run("")
-    paragraph.runs[0].text = text or ""
-    if font_size_pt is not None:
-        paragraph.runs[0].font.size = Pt(font_size_pt)
-    if bold is not None:
-        paragraph.runs[0].bold = bold
-    # 나머지 run 비움
-    for run in paragraph.runs[1:]:
-        run.text = ""
+    max_w_in = 5.7
+    max_h_in = 3.45
+    aspect = w_px / h_px if h_px else 1
+    width_in = min(max_w_in, max_h_in * aspect)
+    height_in = width_in / aspect
 
+    if height_in > max_h_in:
+        height_in = max_h_in
+        width_in = height_in * aspect
 
-def set_cell_value(cell, text: str, font_size_pt: float = 13.0, bold: Optional[bool] = None, center: bool = True):
-    """셀 내부의 기존 서식을 최대한 유지하며 값만 교체한다."""
-    cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
-    if not cell.paragraphs:
-        p = cell.add_paragraph()
-    else:
-        p = cell.paragraphs[0]
-    if center:
-        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    set_first_run_text_keep_style(p, text, font_size_pt=font_size_pt, bold=bold)
-    # 나머지 문단은 비워서 원본 셀 구조는 유지하되 표시 텍스트만 제거
-    for extra_p in cell.paragraphs[1:]:
-        extra_p.alignment = WD_ALIGN_PARAGRAPH.CENTER if center else extra_p.alignment
-        clear_paragraph_keep_style(extra_p)
-
-
-def set_amount_cell(cell, amount: str):
-    """사용금액 셀은 1번째 문단 금액만 교체하고, 2번째 문단 비목은 원본 그대로 유지한다."""
-    cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
-    if not cell.paragraphs:
-        p = cell.add_paragraph()
-    else:
-        p = cell.paragraphs[0]
+    p = receipt_cell.add_paragraph()
+    try:
+        p.style = "바탕글"
+    except Exception:
+        pass
     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    set_first_run_text_keep_style(p, amount, font_size_pt=13.0, bold=None)
-    # 비목 문단은 건드리지 않음. 단, 원본처럼 가운데 정렬 유지
-    if len(cell.paragraphs) > 1:
-        cell.paragraphs[1].alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = p.add_run()
+    run.add_picture(str(img_path), width=Inches(width_in))
 
 
-def set_table_cells(doc: Document, receipt: ReceiptItem, card_name: str, user_name: str, purpose: str):
-    if not doc.tables:
-        raise HTTPException(status_code=500, detail="템플릿에 표가 없습니다.")
+def fill_template(receipt: ReceiptItem, card_name: str, user_name: str, purpose: str, img_path: Path) -> Document:
+    doc = Document(str(TEMPLATE_PATH))
     table = doc.tables[0]
 
-    # 원본 표 구조 기준 행/열 입력. 병합 셀은 첫 번째 셀에만 넣어도 같은 셀에 반영됨.
-    set_cell_value(table.rows[1].cells[1], card_name, font_size_pt=13.0)
-    set_cell_value(table.rows[1].cells[3], receipt.use_date, font_size_pt=13.0)
-    set_cell_value(table.rows[2].cells[1], user_name, font_size_pt=13.0)
-    set_cell_value(table.rows[3].cells[1], purpose or "", font_size_pt=13.0)
-    set_cell_value(table.rows[4].cells[1], receipt.store, font_size_pt=13.0)
-    set_amount_cell(table.rows[5].cells[1], receipt.amount)
+    # 원본 표 셀 위치 기준으로 직접 입력
+    write_center(table.cell(1, 1), card_name, size_pt=13)
+    write_center(table.cell(1, 3), receipt.use_date, size_pt=13)
+    write_center(table.cell(2, 1), user_name, size_pt=13)
+    write_center(table.cell(3, 1), purpose or "", size_pt=13)
+    write_center(table.cell(4, 1), receipt.store, size_pt=13)
+    write_amount_cell(table.cell(5, 1), receipt.amount)
 
-    # 레이블/헤더 셀도 원본처럼 셀 가운데 정렬 유지
+    # 모든 셀은 세로 가운데, 라벨/제목 포함 기존 정렬 유지 보정
     for row in table.rows:
         for cell in row.cells:
             cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
             for p in cell.paragraphs:
                 if p.alignment is None:
-                    # 템플릿 값 셀은 모두 가운데 기준으로 보이게 함
                     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
-
-def receipt_insert_cell(doc: Document):
-    table = doc.tables[0]
-    # 원본 양식에서 마지막 행이 영수증 이미지 영역임
-    return table.rows[-1].cells[0]
-
-
-def clear_receipt_area(cell):
-    for p in cell.paragraphs:
-        clear_paragraph_keep_style(p)
-    if not cell.paragraphs:
-        cell.add_paragraph()
-
-
-def image_display_width_inches(img_path: Path, max_width=4.8, max_height=4.55):
-    """영수증 칸 안에 들어오도록 비율 유지한 표시 폭을 계산한다."""
-    with Image.open(img_path) as img:
-        w, h = img.size
-    if w <= 0 or h <= 0:
-        return max_width
-    aspect = h / w
-    width_by_height = max_height / aspect
-    return max(1.0, min(max_width, width_by_height))
-
-
-def add_receipt_image(doc: Document, img_path: Path):
-    cell = receipt_insert_cell(doc)
-    cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
-    clear_receipt_area(cell)
-    p = cell.paragraphs[0]
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = p.add_run()
-    width_in = image_display_width_inches(img_path, max_width=4.8, max_height=4.55)
-    run.add_picture(str(img_path), width=Inches(width_in))
-
-
-def build_one_page(receipt: ReceiptItem, card_name: str, user_name: str, purpose: str, img_path: Path) -> Document:
-    doc = Document(str(TEMPLATE_PATH))
-    set_table_cells(doc, receipt, card_name, user_name, purpose)
-    add_receipt_image(doc, img_path)
+    insert_receipt_image(doc, img_path)
     return doc
 
 
-def append_template_page(target_doc: Document, source_doc: Document):
+def append_doc_body(target_doc: Document, source_doc: Document):
     target_doc.add_page_break()
     body = target_doc.element.body
     for child in source_doc.element.body:
@@ -195,7 +191,7 @@ def append_template_page(target_doc: Document, source_doc: Document):
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "Receipt DOCX Generator"}
+    return {"status": "ok", "service": "Receipt DOCX Generator", "version": "1.0.4"}
 
 
 @app.get("/health")
@@ -213,24 +209,24 @@ def create_receipt_docx(req: ReceiptRequest):
     tmp_dir = OUT_DIR / str(uuid.uuid4())
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    page_docs = []
+    pages = []
     for i, receipt in enumerate(req.receipts, start=1):
         img_path = tmp_dir / f"receipt_{i}.png"
         normalize_base64_image(receipt.receipt_image_base64, img_path, i)
-        page_docs.append(build_one_page(receipt, req.card_name, req.user_name, req.purpose, img_path))
+        pages.append(fill_template(receipt, req.card_name, req.user_name, req.purpose, img_path))
 
-    final_doc = page_docs[0]
-    for doc in page_docs[1:]:
-        append_template_page(final_doc, doc)
+    final_doc = pages[0]
+    for page in pages[1:]:
+        append_doc_body(final_doc, page)
 
-    safe_name = req.output_filename or "법인카드_영수증_증빙자료.docx"
-    if not safe_name.endswith(".docx"):
-        safe_name += ".docx"
-    out_path = tmp_dir / safe_name
+    filename = req.output_filename or "법인카드_영수증_증빙자료.docx"
+    if not filename.endswith(".docx"):
+        filename += ".docx"
+    out_path = tmp_dir / filename
     final_doc.save(out_path)
 
     return FileResponse(
         out_path,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        filename=safe_name,
+        filename=filename,
     )
