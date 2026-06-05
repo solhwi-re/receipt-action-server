@@ -1,5 +1,5 @@
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File
+from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
 from typing import List, Optional
 from pathlib import Path
@@ -16,21 +16,24 @@ import uuid
 import re
 import requests
 import urllib.parse
+import shutil
 
 BASE_DIR = Path(__file__).resolve().parent
 TEMPLATE_PATH = BASE_DIR / "template.docx"
 OUT_DIR = BASE_DIR / "outputs"
+UPLOAD_DIR = BASE_DIR / "uploads"
 OUT_DIR.mkdir(exist_ok=True)
+UPLOAD_DIR.mkdir(exist_ok=True)
 
-app = FastAPI(title="Receipt DOCX Generator", version="1.0.6")
+app = FastAPI(title="Receipt DOCX Generator", version="1.0.7")
 
 
 class ReceiptItem(BaseModel):
     use_date: str = Field(..., description="YYYY-MM-DD")
     store: str = Field(..., description="영수증 상호명")
     amount: str = Field(..., description="예: 52,000원")
+    receipt_image_url: Optional[str] = Field(None, description="업로드된 영수증 이미지 URL")
     receipt_image_base64: Optional[str] = Field(None, description="영수증 원본 이미지 base64 또는 data URL")
-    receipt_image_url: Optional[str] = Field(None, description="영수증 원본 이미지 URL")
 
 
 class ReceiptRequest(BaseModel):
@@ -106,15 +109,17 @@ def image_from_url(url: str) -> Image.Image:
 def save_receipt_image(receipt: ReceiptItem, output_path: Path):
     img = None
 
-    if receipt.receipt_image_base64 and len(receipt.receipt_image_base64.strip()) > 100:
+    # URL 우선
+    if receipt.receipt_image_url:
         try:
-            img = image_from_base64(receipt.receipt_image_base64)
+            img = image_from_url(receipt.receipt_image_url)
         except Exception:
             img = None
 
-    if img is None and receipt.receipt_image_url:
+    # base64 보조
+    if img is None and receipt.receipt_image_base64 and len(receipt.receipt_image_base64.strip()) > 100:
         try:
-            img = image_from_url(receipt.receipt_image_url)
+            img = image_from_base64(receipt.receipt_image_base64)
         except Exception:
             img = None
 
@@ -144,8 +149,9 @@ def insert_receipt_area(doc, img_path: Optional[Path]):
     with Image.open(img_path) as im:
         w_px, h_px = im.size
 
-    max_w_in = 5.7
-    max_h_in = 3.35
+    # 영수증 칸 안에 들어가도록 보수적으로 축소
+    max_w_in = 5.45
+    max_h_in = 3.25
     aspect = w_px / h_px if h_px else 1
     width_in = min(max_w_in, max_h_in * aspect)
     height_in = width_in / aspect
@@ -188,14 +194,103 @@ def append_doc_body(target_doc: Document, source_doc: Document):
         body.append(deepcopy(child))
 
 
-@app.get("/")
+@app.get("/", response_class=HTMLResponse)
 def root():
-    return {"status": "ok", "service": "Receipt DOCX Generator", "version": "1.0.6"}
+    return """
+    <html>
+      <head><title>Receipt DOCX Generator</title></head>
+      <body style="font-family:sans-serif; padding:40px;">
+        <h2>Receipt DOCX Generator</h2>
+        <p>영수증 이미지를 업로드하려면 아래 링크를 클릭하세요.</p>
+        <p><a href="/upload">영수증 이미지 업로드 페이지 열기</a></p>
+        <p><a href="/health">health check</a></p>
+      </body>
+    </html>
+    """
 
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/upload", response_class=HTMLResponse)
+def upload_page():
+    return """
+    <html>
+      <head><title>영수증 이미지 업로드</title></head>
+      <body style="font-family:sans-serif; padding:40px; max-width:720px;">
+        <h2>영수증 이미지 업로드</h2>
+        <p>영수증 이미지를 업로드하면 image_url이 생성됩니다.</p>
+        <form action="/upload-receipt" enctype="multipart/form-data" method="post">
+          <input name="file" type="file" accept="image/*" required>
+          <button type="submit">업로드</button>
+        </form>
+        <p style="margin-top:30px; color:#666;">생성된 image_url을 복사해서 MyGPT에 함께 전달하세요.</p>
+      </body>
+    </html>
+    """
+
+
+@app.post("/upload-receipt")
+async def upload_receipt(request: Request, file: UploadFile = File(...)):
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="이미지 파일만 업로드할 수 있습니다.")
+
+    folder_id = str(uuid.uuid4())
+    folder = UPLOAD_DIR / folder_id
+    folder.mkdir(parents=True, exist_ok=True)
+
+    ext = Path(file.filename or "").suffix.lower()
+    if ext not in [".jpg", ".jpeg", ".png", ".webp", ".bmp"]:
+        ext = ".png"
+
+    filename = f"receipt{ext}"
+    raw_path = folder / filename
+
+    with raw_path.open("wb") as f:
+        shutil.copyfileobj(file.file, f)
+
+    # 안정적으로 PNG로 변환
+    png_name = "receipt.png"
+    png_path = folder / png_name
+    try:
+        img = Image.open(raw_path)
+        img = ImageOps.exif_transpose(img)
+        img.load()
+        if img.mode not in ("RGB", "RGBA"):
+            img = img.convert("RGB")
+        img.save(png_path, format="PNG")
+    except Exception:
+        raise HTTPException(status_code=400, detail="이미지를 처리할 수 없습니다.")
+
+    base_url = str(request.base_url).rstrip("/")
+    image_url = f"{base_url}/uploaded/{folder_id}/{png_name}"
+
+    return HTMLResponse(f"""
+    <html>
+      <head><title>업로드 완료</title></head>
+      <body style="font-family:sans-serif; padding:40px; max-width:900px;">
+        <h2>업로드 완료</h2>
+        <p>아래 image_url을 복사해서 MyGPT에 전달하세요.</p>
+        <textarea style="width:100%; height:80px;">{image_url}</textarea>
+        <p><a href="{image_url}" target="_blank">업로드 이미지 확인</a></p>
+        <p><a href="/upload">다른 이미지 업로드</a></p>
+      </body>
+    </html>
+    """)
+
+
+@app.get("/uploaded/{folder_id}/{filename}")
+def uploaded_file(folder_id: str, filename: str):
+    safe_folder = Path(folder_id).name
+    safe_filename = Path(filename).name
+    file_path = UPLOAD_DIR / safe_folder / safe_filename
+
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="이미지를 찾을 수 없습니다.")
+
+    return FileResponse(file_path)
 
 
 @app.get("/download/{folder_id}/{filename}")
