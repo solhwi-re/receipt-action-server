@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Receipt DOCX Generator
-  version: 1.0.5
+  version: 1.0.7
 servers:
   - url: https://receipt-action-server.onrender.com
 paths:
@@ -17,9 +17,8 @@ paths:
       operationId: create_receipt_docx_create_receipt_docx_post
       summary: Create Receipt Docx
       description: >
-        법인카드 영수증 증빙자료 DOCX를 생성합니다.
-        영수증 이미지는 receipt_image_base64 또는 receipt_image_url 중 하나로 전달합니다.
-        첨부 이미지가 있는 경우 가능한 한 전체 원본 이미지를 base64로 변환하여 receipt_image_base64에 넣어주세요.
+        법인카드 영수증 증빙자료 DOCX를 생성하고 다운로드 URL을 반환합니다.
+        영수증 이미지는 receipt_image_url을 우선 사용합니다.
       requestBody:
         required: true
         content:
@@ -29,6 +28,10 @@ paths:
       responses:
         "200":
           description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReceiptResponse"
 components:
   schemas:
     ReceiptItem:
@@ -47,15 +50,12 @@ components:
         amount:
           type: string
           description: 최종 승인금액. 예: 52,000원
-        receipt_image_base64:
-          type: string
-          description: >
-            영수증 원본 이미지의 전체 base64 문자열. data:image/png;base64,... 형식도 가능.
-            첨부 이미지를 분석한 뒤 반드시 원본 이미지 전체를 base64로 변환해 입력.
         receipt_image_url:
           type: string
-          description: >
-            영수증 원본 이미지를 서버가 다운로드할 수 있는 URL. base64 전달이 어려운 경우 사용.
+          description: /upload 페이지 또는 /upload-receipt에서 받은 영수증 이미지 URL.
+        receipt_image_base64:
+          type: string
+          description: 선택값. 영수증 원본 이미지 base64.
     ReceiptRequest:
       type: object
       required:
@@ -77,3 +77,14 @@ components:
         output_filename:
           type: string
           default: 법인카드_영수증_증빙자료.docx
+    ReceiptResponse:
+      type: object
+      properties:
+        status:
+          type: string
+        message:
+          type: string
+        download_url:
+          type: string
+        filename:
+          type: string
